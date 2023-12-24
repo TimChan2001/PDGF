@@ -282,7 +282,7 @@ struct queue_entry {
 
 static int edge2prebb[MAP_SIZE];      /* PreBB of edge                    */
 static int edge2sucbb[MAP_SIZE];      /* SucBB of edge                    */
-static int pbbs[MAP_SIZE];            /* PBBs                             */
+static int pbbs[MAP_SIZE*3];            /* PBBs                             */
 static u8 pedges[MAP_SIZE];           /* PEdges                           */
 
 static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
@@ -391,11 +391,11 @@ static void getInfo() {
   }
   FILE * fp2;
   fp2 = fopen("/root/pdgf-files/edge2bb.txt", "r");
-  if (fp == NULL) {
+  if (fp2 == NULL) {
     printf("open error!\n");
   }
   else {
-    while(EOF != fscanf(fp, "%d:%d,%d\n", &edge,&prebb,&sucbb)) {
+    while(EOF != fscanf(fp2, "%d:%d,%d\n", &edge,&prebb,&sucbb)) {
       if (pedges[edge]) continue;
       if (ispbb(sucbb)) pedges[edge] = 1;
       printf("read: %d:%d,%d\n",edge,prebb,sucbb);
@@ -976,40 +976,40 @@ static u8 run_target(char** argv, u32 timeout);
 static inline u8 has_new_bits(u8* virgin_map) {
 
 #ifdef WORD_SIZE_64
-  u8 tmp[MAP_SIZE];
-  for(int j=0;j<MAP_SIZE;j++)
-    tmp[j] = trace_bits[j];
-  u8 *tmp2 = target_path;
-  u8 *tmp3 = use_argv[0];
-  target_path = target_path_2;
-  use_argv[0] = target_path_2;
-  printf("target_path trans to %s; use_argv[0] trans to %s\n",target_path,use_argv[0]);
-  run_target(use_argv, exec_tmout);
-  target_path = tmp2;
-  use_argv[0] = tmp3;
-  printf("target_path transback to %s; use_argv[0] transback to %s\n",target_path,use_argv[0]);
-  int curpp = 0;
-  int allpp = 0;
+  if(target_path_2){
+    u8 tmp[MAP_SIZE];
+    for(int j=0;j<MAP_SIZE;j++)
+      tmp[j] = trace_bits[j];
+    u8 *tmp2 = target_path;
+    u8 *tmp3 = use_argv[0];
+    target_path = target_path_2;
+    use_argv[0] = target_path_2;
+    run_target(use_argv, exec_tmout);
+    target_path = tmp2;
+    use_argv[0] = tmp3;
+    int curpp = 0;
+    int allpp = 0;
 
-  for (int j = 0; j < MAP_SIZE; j++) {
-    if (!trace_bits[j]) continue;
-    if (pedges[j] || ispbb(edge2sucbb[j])) {
-      for (int k = 0; k < MAP_SIZE; k++) {
-        if (pedges[k]) allpp++;
-        if (!trace_bits[k]) continue;
-        curpp++;
-        allpp++;
-        pedges[k] = 1;
-        addpbb(edge2prebb[k]);
-        addpbb(edge2sucbb[k]);
+    for (int j = 0; j < MAP_SIZE; j++) {
+      if (!trace_bits[j]) continue;
+      if (pedges[j] || ispbb(edge2sucbb[j])) {
+        for (int k = 0; k < MAP_SIZE; k++) {
+          if (pedges[k]) allpp++;
+          if (!trace_bits[k]) continue;
+          curpp++;
+          allpp++;
+          pedges[k] = 1;
+          addpbb(edge2prebb[k]);
+          addpbb(edge2sucbb[k]);
+        }
+        break;
       }
-      break;
     }
-  }
-  cur_distance = (allpp+1.0)/(curpp+1.0);
+    cur_distance = (allpp+1.0)/(curpp+1.0);
 
-  for(int j=0;j<MAP_SIZE;j++)
-    trace_bits[j] = tmp[j];
+    for(int j=0;j<MAP_SIZE;j++)
+      trace_bits[j] = tmp[j];
+  }
   
 
   u64* current = (u64*)trace_bits;
@@ -2770,13 +2770,14 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
 
     /* This is relevant when test cases are added w/out save_if_interesting */
-
+printf("max_distance:%f, min_distance%f, cur_distance:%f\n",max_distance,min_distance,cur_distance);
     if (q->distance <= 0) {
 
       /* This calculates cur_distance */
       has_new_bits(virgin_bits);
 
       q->distance = cur_distance;
+      
       if (cur_distance > 0) {
 
         if (max_distance <= 0) {
@@ -8294,7 +8295,7 @@ int main(int argc, char** argv) {
       t_x
   );
 
-
+  getInfo();
   setup_signal_handlers();
   check_asan_opts();
 
