@@ -67,9 +67,7 @@
 #include <sys/ioctl.h>
 #include <sys/file.h>
 
-#if AFLGO_IMPL
 #  include <math.h>
-#endif // AFLGO_IMPL
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
@@ -93,7 +91,7 @@
 
 /* Lots of globals, but mostly for the status UI and other things where it
    really makes no sense to haul them around as function parameters. */
-
+static char** use_argv;
 
 EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
           *out_file,                  /* File to fuzz, if any             */
@@ -104,6 +102,7 @@ EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
           *in_bitmap,                 /* Input bitmap                     */
           *doc_path,                  /* Path to documentation dir        */
           *target_path,               /* Path to target binary            */
+          *target_path_2,               /* Path to target binary            */
           *orig_cmdline;              /* Original command line            */
 
 EXP_ST u32 exec_tmout = EXEC_TIMEOUT; /* Configurable exec timeout (ms)   */
@@ -113,7 +112,6 @@ EXP_ST u64 mem_limit  = MEM_LIMIT;    /* Memory cap for child (MB)        */
 
 static u32 stats_update_freq = 1;     /* Stats update frequency (execs)   */
 
-#if AFLGO_IMPL
 
 static u8 cooling_schedule = 0;       /* Cooling schedule for directed fuzzing */
 
@@ -124,7 +122,6 @@ enum {
   /* 03 */ SAN_QUAD                   /* Quadratic schedule                    */
 };
 
-#endif // AFLGO_IMPL
 
 EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            force_deterministic,       /* Force deterministic stages?      */
@@ -276,14 +273,17 @@ struct queue_entry {
   u8* trace_mini;                     /* Trace bytes, if kept             */
   u32 tc_ref;                         /* Trace bytes ref count            */
 
-#if AFLGO_IMPL
   double distance;                    /* Distance to targets              */
-#endif // AFLGO_IMPL
 
   struct queue_entry *next,           /* Next element, if any             */
                      *next_100;       /* 100 elements ahead               */
 
 };
+
+static int edge2prebb[MAP_SIZE];      /* PreBB of edge                    */
+static int edge2sucbb[MAP_SIZE];      /* SucBB of edge                    */
+static int pbbs[MAP_SIZE];            /* PBBs                             */
+static u8 pedges[MAP_SIZE];           /* PEdges                           */
 
 static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_cur, /* Current offset within the queue  */
@@ -305,14 +305,12 @@ static u32 extras_cnt;                /* Total number of tokens read      */
 static struct extra_data* a_extras;   /* Automatically selected extras    */
 static u32 a_extras_cnt;              /* Total number of tokens available */
 
-#if AFLGO_IMPL
 
 static double cur_distance = -1.0;     /* Distance of executed input             */
 static double max_distance = -1.0;     /* Maximal distance for any input         */
 static double min_distance = -1.0;     /* Minimal distance for any input         */
 static u32 t_x = 10;                   /* Time to exploitation (Default: 10 min) */
 
-#endif // AFLGO_IMPL
 
 static u8* (*post_handler)(u8* buf, u32* len);
 
@@ -363,6 +361,49 @@ enum {
   /* 05 */ FAULT_NOBITS
 };
 
+int ispbb(int bb) {
+  for(int i = 1;i <= pbbs[0];i++) {
+    if(pbbs[i] == bb) return 1;
+  }
+  return 0;
+}
+
+void addpbb(int bb) {
+  if(ispbb(bb)) return;
+  pbbs[0]++;
+  pbbs[pbbs[0]] = bb;
+}
+
+static void getInfo() {
+  pbbs[0] = 0;
+  int pbb,edge,prebb,sucbb;
+  FILE * fp;
+  fp = fopen("/root/pdgf-files/pbb.txt", "r");
+  if (fp == NULL) {
+    printf("open error!\n");
+  }
+  else {
+    while(EOF != fscanf(fp, "%d\n", &pbb)){
+      printf("read: %d\n",pbb);
+      pbbs[0]++;
+      pbbs[pbbs[0]] = pbb;
+    }
+  }
+  FILE * fp2;
+  fp2 = fopen("/root/pdgf-files/edge2bb.txt", "r");
+  if (fp == NULL) {
+    printf("open error!\n");
+  }
+  else {
+    while(EOF != fscanf(fp, "%d:%d,%d\n", &edge,&prebb,&sucbb)) {
+      if (pedges[edge]) continue;
+      if (ispbb(sucbb)) pedges[edge] = 1;
+      printf("read: %d:%d,%d\n",edge,prebb,sucbb);
+      edge2prebb[edge] = prebb;
+      edge2sucbb[edge] = sucbb;
+    }
+  }
+}
 
 /* Get unix time in milliseconds */
 
@@ -824,7 +865,6 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->depth        = cur_depth + 1;
   q->passed_det   = passed_det;
 
-#if AFLGO_IMPL
 
   q->distance = cur_distance;
 
@@ -839,7 +879,6 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   }
 
-#endif // AFLGO_IMPL
 
   if (q->depth > max_depth) max_depth = q->depth;
 
@@ -933,29 +972,65 @@ EXP_ST void read_bitmap(u8* fname) {
 
    This function is called after every exec() on a fairly large buffer, so
    it needs to be fast. We do this in 32-bit and 64-bit flavors. */
-
+static u8 run_target(char** argv, u32 timeout);
 static inline u8 has_new_bits(u8* virgin_map) {
 
 #ifdef WORD_SIZE_64
+  u8 tmp[MAP_SIZE];
+  for(int j=0;j<MAP_SIZE;j++)
+    tmp[j] = trace_bits[j];
+  u8 *tmp2 = target_path;
+  u8 *tmp3 = use_argv[0];
+  target_path = target_path_2;
+  use_argv[0] = target_path_2;
+  printf("target_path trans to %s; use_argv[0] trans to %s\n",target_path,use_argv[0]);
+  run_target(use_argv, exec_tmout);
+  target_path = tmp2;
+  use_argv[0] = tmp3;
+  printf("target_path transback to %s; use_argv[0] transback to %s\n",target_path,use_argv[0]);
+  int curpp = 0;
+  int allpp = 0;
+
+  for (int j = 0; j < MAP_SIZE; j++) {
+    if (!trace_bits[j]) continue;
+    if (pedges[j] || ispbb(edge2sucbb[j])) {
+      for (int k = 0; k < MAP_SIZE; k++) {
+        if (pedges[k]) allpp++;
+        if (!trace_bits[k]) continue;
+        curpp++;
+        allpp++;
+        pedges[k] = 1;
+        addpbb(edge2prebb[k]);
+        addpbb(edge2sucbb[k]);
+      }
+      break;
+    }
+  }
+  cur_distance = (allpp+1.0)/(curpp+1.0);
+
+  for(int j=0;j<MAP_SIZE;j++)
+    trace_bits[j] = tmp[j];
+  
 
   u64* current = (u64*)trace_bits;
   u64* virgin  = (u64*)virgin_map;
 
   u32  i = (MAP_SIZE >> 3);
 
-#  if AFLGO_IMPL
+  
+
+
 
   /* Calculate distance of current input to targets */
   
-  u64* total_distance = (u64*) (trace_bits + MAP_SIZE);
-  u64* total_count = (u64*) (trace_bits + MAP_SIZE + 8);
+  // u64* total_distance = (u64*) (trace_bits + MAP_SIZE);
+  // u64* total_count = (u64*) (trace_bits + MAP_SIZE + 8);
 
-  if (*total_count > 0)
-    cur_distance = (double) (*total_distance) / (double) (*total_count);
-  else
-    cur_distance = -1.0;
+  // if (*total_count > 0)
+  //   cur_distance = (double) (*total_distance) / (double) (*total_count);
+  // else
+  //   cur_distance = -1.0;
 
-#  endif // AFLGO_IMPL
 
 #else
 
@@ -1435,12 +1510,7 @@ EXP_ST void setup_shm(void) {
   memset(virgin_tmout, 255, MAP_SIZE);
   memset(virgin_crash, 255, MAP_SIZE);
 
-#if AFLGO_IMPL
-  /* Allocate 16 byte more for distance info */
-  shm_id = shmget(IPC_PRIVATE, MAP_SIZE + 16, IPC_CREAT | IPC_EXCL | 0600);
-#else
   shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
-#endif // AFLGO_IMPL
 
   if (shm_id < 0) PFATAL("shmget() failed");
 
@@ -2351,6 +2421,7 @@ EXP_ST void init_forkserver(char** argv) {
    information. The called program will update trace_bits[]. */
 
 static u8 run_target(char** argv, u32 timeout) {
+  // printf("target_path:%s argv:%s %s %s %s\n",target_path,argv[0],argv[1],argv[2],argv[3]);
 
   static struct itimerval it;
   static u32 prev_timed_out = 0;
@@ -2365,11 +2436,7 @@ static u8 run_target(char** argv, u32 timeout) {
      must prevent any earlier operations from venturing into that
      territory. */
 
-#if AFLGO_IMPL
-  memset(trace_bits, 0, MAP_SIZE + 16);
-#else
   memset(trace_bits, 0, MAP_SIZE);
-#endif // AFLGO_IMPL
   MEM_BARRIER();
 
   /* If we're running in "dumb" mode, we can't rely on the fork server
@@ -2409,7 +2476,7 @@ static u8 run_target(char** argv, u32 timeout) {
 
       /* Isolate the process and configure standard descriptors. If out_file is
          specified, stdin is /dev/null; otherwise, out_fd is cloned instead. */
-
+      
       setsid();
 
       dup2(dev_null_fd, 1);
@@ -2445,6 +2512,7 @@ static u8 run_target(char** argv, u32 timeout) {
                              "msan_track_origins=0", 0);
 
       execv(target_path, argv);
+      
 
       /* Use a distinctive bitmap value to tell the parent about execv()
          falling through. */
@@ -2700,7 +2768,6 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
     cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
 
-#if AFLGO_IMPL
 
     /* This is relevant when test cases are added w/out save_if_interesting */
 
@@ -2723,7 +2790,6 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
     }
 
-#endif // AFLGO_IMPL
 
     if (q->exec_cksum != cksum) {
 
@@ -4911,7 +4977,6 @@ static u32 calculate_score(struct queue_entry* q) {
 
   }
 
-#if AFLGO_IMPL
 
   u64 cur_ms = get_cur_time();
   u64 t = (cur_ms - start_time) / 1000;
@@ -4968,13 +5033,11 @@ static u32 calculate_score(struct queue_entry* q) {
 
   perf_score *= power_factor;
 
-#endif // AFLGO_IMPL
 
   /* Make sure that we don't go over limit. */
 
   if (perf_score > HAVOC_MAX_MULT * 100) perf_score = HAVOC_MAX_MULT * 100;
 
-#if AFLGO_IMPL
   /* AFLGO-DEBUGGING */
   /*
   fprintf(stderr, "[Time %llu] "
@@ -4986,7 +5049,6 @@ static u32 calculate_score(struct queue_entry* q) {
                   "adjusted perf_score: %4d\n",
     t, q->distance, max_distance, min_distance, T, power_factor, perf_score);
   */
-#endif // AFLGO_IMPL
 
   return perf_score;
 
@@ -7302,14 +7364,12 @@ static void usage(u8* argv0) {
        "  -i dir        - input directory with test cases\n"
        "  -o dir        - output directory for fuzzer findings\n\n"
 
-#if AFLGO_IMPL
        "Directed fuzzing specific settings:\n\n"
 
        "  -z schedule   - temperature-based power schedules\n"
        "                  {exp, log, lin, quad} (Default: exp)\n"
        "  -c min        - time from start when SA enters exploitation\n"
        "                  in secs (s), mins (m), hrs (h), or days (d)\n\n"
-#endif // AFLGO_IMPL
 
        "Execution control settings:\n\n"
 
@@ -7963,7 +8023,7 @@ static void save_cmdline(u32 argc, char** argv) {
 
 #ifndef AFL_LIB
 
-#if AFLGO_IMPL
+
 
 int stricmp(char const *a, char const *b) {
   int d;
@@ -7973,8 +8033,6 @@ int stricmp(char const *a, char const *b) {
       return d;
   }
 }
-
-#endif // AFLGO_IMPL
 
 /* Main entry point */
 
@@ -7986,27 +8044,23 @@ int main(int argc, char** argv) {
   u8  *extras_dir = 0;
   u8  mem_limit_given = 0;
   u8  exit_1 = !!getenv("AFL_BENCH_JUST_ONE");
-  char** use_argv;
 
   struct timeval tv;
   struct timezone tz;
 
-#if AFLGO_IMPL
-  SAYF(cCYA "aflgo (yeah!) " cBRI VERSION cRST "\n");
-#else
+
   SAYF(cCYA "afl-fuzz " cBRI VERSION cRST " by <lcamtuf@google.com>\n");
-#endif // AFLGO_IMPL
+
 
   doc_path = access(DOC_PATH, F_OK) ? "docs" : DOC_PATH;
 
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-#if AFLGO_IMPL
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Qz:c:")) > 0)
-#else
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Q")) > 0)
-#endif // AFLGO_IMPL
+
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Qz:c:b:")) > 0)
+
+
 
     switch (opt) {
 
@@ -8174,7 +8228,6 @@ int main(int argc, char** argv) {
 
         break;
 
-#if AFLGO_IMPL
 
       case 'z': /* Cooling schedule for Directed Fuzzing */
 
@@ -8215,7 +8268,13 @@ int main(int argc, char** argv) {
 
         break;
 
-#endif // AFLGO_IMPL
+      case 'b': /* second binary */
+
+        if (target_path_2) FATAL("Multiple -b options not supported");
+        target_path_2 = optarg;
+
+        break;
+
 
       default:
 
@@ -8225,7 +8284,6 @@ int main(int argc, char** argv) {
 
   if (optind == argc || !in_dir || !out_dir) usage(argv[0]);
 
-#if AFLGO_IMPL
 
   OKF("Running with " cBRI "%s" cRST " schedule "
       "and time-to-exploitation set to " cBRI "%d minutes" cRST,
@@ -8236,7 +8294,6 @@ int main(int argc, char** argv) {
       t_x
   );
 
-#endif // AFLGO_IMPL
 
   setup_signal_handlers();
   check_asan_opts();
@@ -8316,6 +8373,7 @@ int main(int argc, char** argv) {
     use_argv = get_qemu_argv(argv[0], argv + optind, argc - optind);
   else
     use_argv = argv + optind;
+  printf("%s\n",use_argv[0]);
 
   perform_dry_run(use_argv);
 
