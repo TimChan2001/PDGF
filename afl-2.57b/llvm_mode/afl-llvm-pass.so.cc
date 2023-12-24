@@ -464,10 +464,32 @@ bool AFLCoverage::runOnModule(Module &M)
       errs() << cRED "[*] Empty function!" << F.getName() << "\n" cRST;
     }
   }
+
+  IRBuilder<> Builder(C);
+
+  // 创建printf和exit函数的声明
+  FunctionCallee printfFunc = M.getOrInsertFunction("printf", llvm::FunctionType::get(llvm::IntegerType::getInt32Ty(C), llvm::PointerType::get(llvm::Type::getInt8Ty(C), 0), true));
+  FunctionCallee exitFunc = M.getOrInsertFunction("exit", llvm::FunctionType::get(llvm::Type::getVoidTy(C), llvm::IntegerType::getInt32Ty(C), false));
+
+  Constant *str = ConstantDataArray::getString(C, "1\n", true);
+  GlobalVariable *printStrVar = new GlobalVariable(M, str->getType(), true, GlobalValue::PrivateLinkage, str, ".str");
+  Value *printStr = Builder.CreatePointerCast(printStrVar, PointerType::getUnqual(Type::getInt8Ty(C)));
+
+  // 创建要打印的字符串
+  // Value *printStr = Builder.CreateGlobalStringPtr("1\n");
   for (auto &BB : visited){
     BlockInfo *pbb = NULL;
     pbb = getBlockInfo(BB);
     if(pbb) fdom2 << pbb->BlockId << "\n";
+    BasicBlock::iterator IP2 = BB->getFirstInsertionPt();
+    IRBuilder<> Builder(&(*IP2));
+    // Builder.SetInsertPoint(BB);
+
+    // 插入printf调用
+    Builder.CreateCall(printfFunc, printStr);
+
+    // 插入exit调用
+    Builder.CreateCall(exitFunc, ConstantInt::get(Type::getInt32Ty(C), 0));
   } 
 
   /* Say something nice. */
